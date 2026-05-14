@@ -239,6 +239,120 @@ class UniLSGen(nn.Module):
             results["gt_motion_code"] = gt_motion_code
         return results
 
+    @torch.inference_mode()
+    def init_stream_state(self, style_motion_code=None):
+        """Initialize streaming state for one speaker.
+
+        Args:
+            style_motion_code: Optional [1, 2, patch_len, motion_dim] tensor (the
+                dyadic style — we keep speaker 0 only, matching `inference()`'s
+                `unbind(dim=1)[0]` at line 160). May also be [1, patch_len,
+                motion_dim] if already de-dyaded, or None for zero style.
+
+        Returns dict with:
+            - style_feat: precomputed [2, sum(patch_nums), attn_dim] CFG-doubled style features
+            - prev_motion_code: mutable [1, patch_len, motion_dim] (zeros initially)
+            - sos_token: [2, 1, attn_dim]
+        """
+        patch_len = max(self.patch_nums)
+        device = self.device
+        if style_motion_code is None:
+            style_motion_code = torch.zeros(1, patch_len, self.motion_dim, device=device)
+        elif style_motion_code.dim() == 4:
+            # [1, 2, patch_len, motion_dim] -> [1, patch_len, motion_dim] (speaker 0)
+            style_motion_code = style_motion_code.unbind(dim=1)[0]
+        style_motion_code = style_motion_code.to(device)
+
+        # CFG-double the style (matches inference() line 192).
+        style_uncond = style_motion_code.new_zeros(style_motion_code.shape)
+        style_motion_code_cfg = torch.cat([style_motion_code, style_uncond], dim=0)
+        style_feat = self.code_token_embed(self.get_motion_feat(style_motion_code_cfg))
+
+        prev_motion_code = torch.zeros(1, patch_len, self.motion_dim, device=device)
+        sos_token = self.sos_embed.expand(2, 1, -1)
+
+        return {
+            "style_feat": style_feat,
+            "prev_motion_code": prev_motion_code,
+            "sos_token": sos_token,
+        }
+
+    @torch.inference_mode()
+    def stream_step(self, audio_chunk, state, tau=1.0, cfg=2.0):
+        """Process one 4-second patch of paired audio for one speaker.
+
+        Args:
+            audio_chunk: [1, 2, patch_audio_length] where channel 0 = self,
+                channel 1 = other.
+            state: dict returned by init_stream_state (will be mutated).
+            tau, cfg: sampling temperature and classifier-free-guidance scale,
+                matching `inference()` defaults.
+
+        Returns:
+            pred_motion_code: [1, patch_len, motion_dim]
+            state: updated dict (same object, mutated)
+        """
+        patch_len = max(self.patch_nums)
+        patch_audio_length = int(patch_len * self._sample_rate / self._motion_fps)
+        assert audio_chunk.dim() == 3 and audio_chunk.shape[0] == 1 and audio_chunk.shape[1] == 2, (
+            f"stream_step expects audio_chunk shape [1, 2, {patch_audio_length}], "
+            f"got {tuple(audio_chunk.shape)}"
+        )
+        assert audio_chunk.shape[-1] == patch_audio_length, (
+            f"stream_step expects audio_chunk shape [1, 2, {patch_audio_length}], "
+            f"got {tuple(audio_chunk.shape)}"
+        )
+        batch_size = 1
+
+        # Encode this patch's audio (mirror inference() lines 174-182, 190-192).
+        audio_0, audio_1 = audio_chunk.unbind(dim=1)  # each [1, T]
+        af_0 = self.audio_encoder(audio_0)
+        af_1 = self.audio_encoder(audio_1)
+        audio_uncond = af_0.new_zeros(af_0.shape)
+        curr_audio_feat_0 = torch.cat([af_0, audio_uncond], dim=0)
+        curr_audio_feat_1 = torch.cat([af_1, audio_uncond], dim=0)
+
+        # CFG-double the carried prev_motion_code (mirror line 189).
+        prev_motion_code_single = state["prev_motion_code"]
+        prev_uncond = prev_motion_code_single.new_zeros(prev_motion_code_single.shape)
+        prev_motion_code = torch.cat([prev_motion_code_single, prev_uncond], dim=0)
+        prev_feat = self.code_token_embed(self.get_motion_feat(prev_motion_code))
+
+        sos_token = state["sos_token"]
+        style_feat = state["style_feat"]
+        next_ar_vqfeat = sos_token
+
+        # Hierarchical patch decoding (verbatim port of inference() lines 203-230).
+        patch_motion_bits = []
+        for pidx, pn in enumerate(self.patch_nums):
+            attn_feat = self.attn_blocks(
+                next_ar_vqfeat, curr_audio_feat_0, curr_audio_feat_1, prev_feat, style_feat
+            )
+            motion_logits = self.logits_head(attn_feat)
+            motion_logits = motion_logits[:, sum(self.patch_nums[:pidx]):]
+            motion_logits = motion_logits.mul(1 / tau)
+            motion_logits = motion_logits.view(motion_logits.shape[0], motion_logits.shape[1], -1, 2)
+            if cfg > 1.0:
+                motion_logits = cfg * motion_logits[:batch_size] + (1 - cfg) * motion_logits[batch_size:]
+            else:
+                motion_logits = motion_logits[:batch_size]
+            motion_bits = sample_idx_with_top_p_(motion_logits)
+            patch_motion_bits.append(motion_bits)
+            if pidx < len(self.patch_nums) - 1:
+                next_ar_vqfeat = self.base_codec.vqidx_to_next_feat(
+                    torch.cat(patch_motion_bits, dim=1), pidx, "accum_next"
+                )
+                next_ar_vqfeat = self.code_token_embed(next_ar_vqfeat)
+                next_ar_vqfeat = torch.cat([next_ar_vqfeat, next_ar_vqfeat], dim=0)  # CFG
+                next_ar_vqfeat = torch.cat([sos_token, next_ar_vqfeat], dim=1)
+
+        patch_motion_bits = torch.cat(patch_motion_bits, dim=1)
+        pred_motion_code = self.base_codec.vqidx_to_motion(patch_motion_bits)  # [1, patch_len, motion_dim]
+
+        # Update state — single (un-doubled) form, redoubling happens next call.
+        state["prev_motion_code"] = pred_motion_code
+        return pred_motion_code, state
+
     def _calc_losses(self, train_results, _loss_kwargs):
         if train_results["pred_motion_logits"].dim() == 3:
             B, L, _ = train_results["pred_motion_logits"].shape

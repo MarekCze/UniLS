@@ -1,9 +1,13 @@
 #!/usr/bin/env python
 # Copyright (c) Xuangeng Chu (xg.chu@outlook.com)
 
+import math
 import os
 
+import numpy as np
 import torch
+import torch.nn.functional as F
+import torchaudio
 from scipy.signal import savgol_filter
 
 from core.libs.flame_model import FLAMEModel, RenderMesh
@@ -43,6 +47,15 @@ class InferEngine:
             print(f"Missing keys: {missing}")
         model.eval()
         self.model = model
+
+        # Streaming state (initialised by start_stream).
+        self._is_audio_driven = hasattr(self.model, "audio_encoder")
+        self._stream_state_0 = None
+        self._stream_state_1 = None
+        self._stream_buf_0 = None
+        self._stream_buf_1 = None
+        self._stream_sample_rate = None
+        self._stream_patch_audio_length = None
 
     @staticmethod
     def _extract_meta_cfg(full_checkpoint):
@@ -114,6 +127,158 @@ class InferEngine:
                 sample_rate=16000,
             )
         return infer_results
+
+    # ------------------------------------------------------------------ #
+    # Streaming API                                                       #
+    # ------------------------------------------------------------------ #
+
+    def start_stream(self, style_motion_0=None, style_motion_1=None):
+        """Initialise per-speaker streaming state.
+
+        For audio-driven models (UniLSGen), style may be None (→ zeros).
+        For audio-free models (UniLSFreeGen), style is required.
+        """
+        self._stream_state_0 = self.model.init_stream_state(style_motion_0)
+        self._stream_state_1 = self.model.init_stream_state(style_motion_1)
+        self._stream_sample_rate = int(self.meta_cfg.DATASET.AUDIO_SAMPLE_RATE)
+        self._stream_patch_audio_length = int(
+            max(self.model.patch_nums)
+            * self._stream_sample_rate
+            / self.meta_cfg.DATASET.MOTION_FPS
+        )
+        self._stream_buf_0 = torch.zeros(0, device=self.device)
+        self._stream_buf_1 = torch.zeros(0, device=self.device)
+
+    @torch.inference_mode()
+    def push_audio(self, audio_0, audio_1, sample_rate=16000, tau=1.0, cfg=1.5):
+        """Push paired audio chunks; emit (motion_0, motion_1) for any completed patches.
+
+        audio_0 / audio_1 may be torch tensors (1D or 2D mono), numpy arrays, or None.
+        Returns two [frames, motion_dim] tensors (possibly empty).
+        """
+        if not self._is_audio_driven:
+            raise RuntimeError(
+                "push_audio is only valid for audio-driven models. "
+                "For UniLSFreeGen use pull_motion()."
+            )
+        if self._stream_state_0 is None:
+            raise RuntimeError("Stream not initialised. Call start_stream() first.")
+
+        a0 = self._coerce_audio(audio_0, sample_rate)
+        a1 = self._coerce_audio(audio_1, sample_rate)
+
+        # Zero-pad the shorter side so the two buffers always grow in lockstep.
+        if a0.numel() != a1.numel():
+            n = max(a0.numel(), a1.numel())
+            a0 = F.pad(a0, (0, n - a0.numel()))
+            a1 = F.pad(a1, (0, n - a1.numel()))
+
+        self._stream_buf_0 = torch.cat([self._stream_buf_0, a0])
+        self._stream_buf_1 = torch.cat([self._stream_buf_1, a1])
+
+        out_0, out_1 = [], []
+        plen = self._stream_patch_audio_length
+        while self._stream_buf_0.numel() >= plen:
+            patch_0 = self._stream_buf_0[:plen]
+            patch_1 = self._stream_buf_1[:plen]
+            self._stream_buf_0 = self._stream_buf_0[plen:]
+            self._stream_buf_1 = self._stream_buf_1[plen:]
+
+            # Speaker 0: self=audio_0, other=audio_1.
+            paired_0 = torch.stack([patch_0, patch_1], dim=0).unsqueeze(0)
+            m0, self._stream_state_0 = self.model.stream_step(
+                paired_0, self._stream_state_0, tau=tau, cfg=cfg
+            )
+            # Speaker 1: self=audio_1, other=audio_0 (swap channels).
+            paired_1 = torch.stack([patch_1, patch_0], dim=0).unsqueeze(0)
+            m1, self._stream_state_1 = self.model.stream_step(
+                paired_1, self._stream_state_1, tau=tau, cfg=cfg
+            )
+            out_0.append(m0[0])
+            out_1.append(m1[0])
+
+        if not out_0:
+            empty = torch.empty((0, self.model.motion_dim), device=self.device)
+            return empty, empty
+        return torch.cat(out_0, dim=0), torch.cat(out_1, dim=0)
+
+    @torch.inference_mode()
+    def pull_motion(self, num_chunks=1, tau=1.0, cfg=1.5):
+        """Generate the next `num_chunks * patch_len` motion frames for both speakers.
+
+        Only valid for audio-free models (UniLSFreeGen).
+        """
+        if self._is_audio_driven:
+            raise RuntimeError(
+                "pull_motion is only valid for audio-free models. "
+                "For UniLSGen use push_audio()."
+            )
+        if self._stream_state_0 is None:
+            raise RuntimeError("Stream not initialised. Call start_stream() first.")
+        out_0, out_1 = [], []
+        for _ in range(num_chunks):
+            m0, self._stream_state_0 = self.model.stream_step(
+                self._stream_state_0, tau=tau, cfg=cfg
+            )
+            m1, self._stream_state_1 = self.model.stream_step(
+                self._stream_state_1, tau=tau, cfg=cfg
+            )
+            out_0.append(m0[0])
+            out_1.append(m1[0])
+        return torch.cat(out_0, dim=0), torch.cat(out_1, dim=0)
+
+    @torch.inference_mode()
+    def finalize_stream(self, tau=1.0, cfg=1.5):
+        """Drain the audio buffer with zero-padding; trim output to the actual audio length."""
+        if not self._is_audio_driven:
+            empty = torch.empty((0, self.model.motion_dim), device=self.device)
+            return empty, empty
+        if self._stream_state_0 is None:
+            raise RuntimeError("Stream not initialised. Call start_stream() first.")
+
+        rem = self._stream_buf_0.numel()
+        if rem == 0:
+            empty = torch.empty((0, self.model.motion_dim), device=self.device)
+            return empty, empty
+
+        plen = self._stream_patch_audio_length
+        pad = plen - rem
+        p0 = F.pad(self._stream_buf_0, (0, pad))
+        p1 = F.pad(self._stream_buf_1, (0, pad))
+
+        paired_0 = torch.stack([p0, p1], dim=0).unsqueeze(0)
+        paired_1 = torch.stack([p1, p0], dim=0).unsqueeze(0)
+        m0, self._stream_state_0 = self.model.stream_step(
+            paired_0, self._stream_state_0, tau=tau, cfg=cfg
+        )
+        m1, self._stream_state_1 = self.model.stream_step(
+            paired_1, self._stream_state_1, tau=tau, cfg=cfg
+        )
+
+        keep = math.ceil(
+            rem / self._stream_sample_rate * self.meta_cfg.DATASET.MOTION_FPS
+        )
+        self._stream_buf_0 = self._stream_buf_0.new_zeros(0)
+        self._stream_buf_1 = self._stream_buf_1.new_zeros(0)
+        return m0[0][:keep], m1[0][:keep]
+
+    def _coerce_audio(self, audio, sample_rate):
+        """Convert input audio to a 1D float tensor on device, resampled to the stream rate."""
+        if audio is None:
+            return torch.zeros(0, device=self.device)
+        if isinstance(audio, np.ndarray):
+            audio = torch.from_numpy(audio)
+        if not isinstance(audio, torch.Tensor):
+            audio = torch.as_tensor(audio)
+        if audio.dim() == 2:
+            audio = audio.mean(dim=0)
+        assert audio.dim() == 1, f"Expected 1D mono audio, got shape {tuple(audio.shape)}"
+        audio = audio.to(self.device).float()
+        target_sr = self._stream_sample_rate
+        if sample_rate != target_sr:
+            resampler = torchaudio.transforms.Resample(sample_rate, target_sr).to(self.device)
+            audio = resampler(audio[None])[0]
+        return audio
 
     @torch.inference_mode()
     def visualize(

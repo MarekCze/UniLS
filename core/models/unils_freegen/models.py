@@ -165,6 +165,102 @@ class UniLSFreeGen(nn.Module):
             results["pred_motion_code"] = pred_motion_codes
         return results
 
+    @torch.inference_mode()
+    def init_stream_state(self, style_motion_code):
+        """Initialize streaming state for one speaker.
+
+        Args:
+            style_motion_code: Required [1, patch_len, motion_dim] tensor.
+                (Unlike UniLSGen, FreeGen needs the style — it's the only
+                conditioning signal. May also be [1, 2, patch_len, motion_dim],
+                in which case speaker 0 is taken.)
+
+        Returns dict with:
+            - style_feat: precomputed [2, sum(patch_nums), attn_dim] CFG-doubled style features
+            - prev_motion_code: mutable [1, patch_len, motion_dim] (seeded with style, matching inference() line 115)
+            - sos_token: [2, 1, attn_dim]
+        """
+        assert style_motion_code is not None, "UniLSFreeGen requires style_motion_code."
+        if style_motion_code.dim() == 4:
+            style_motion_code = style_motion_code.unbind(dim=1)[0]
+        style_motion_code = style_motion_code.to(self.device)
+        assert style_motion_code.shape[0] == 1, "Only batch size 1 supported."
+
+        # CFG-double the style (matches inference() lines 116-118).
+        style_uncond = style_motion_code.new_zeros(style_motion_code.shape)
+        style_motion_code_cfg = torch.cat([style_motion_code, style_uncond], dim=0)
+        style_feat = self.code_token_embed(self.get_motion_feat(style_motion_code_cfg))
+
+        # Seed prev_motion_code with the style itself — matches inference() line 115:
+        # prev_motion_code = torch.cat([style_motion_code, style_motion_code], dim=0)
+        # Here we store the un-doubled form; redoubling happens in stream_step.
+        prev_motion_code = style_motion_code.clone()
+        sos_token = self.sos_embed.expand(2, 1, -1)
+
+        return {
+            "style_feat": style_feat,
+            "prev_motion_code": prev_motion_code,
+            "sos_token": sos_token,
+        }
+
+    @torch.inference_mode()
+    def stream_step(self, state, tau=1.0, cfg=2.0):
+        """Generate the next 4-second patch of motion for one speaker.
+
+        No audio input — UniLSFreeGen is audio-free.
+
+        Args:
+            state: dict returned by init_stream_state (will be mutated).
+            tau, cfg: sampling temperature and classifier-free-guidance scale,
+                matching `inference()` defaults.
+
+        Returns:
+            pred_motion_code: [1, patch_len, motion_dim]
+            state: updated dict (same object, mutated)
+        """
+        batch_size = 1
+
+        # CFG-double prev_motion_code (mirror inference() lines 115 + line 153).
+        prev_motion_code_single = state["prev_motion_code"]
+        # FreeGen duplicates the SAME prev (not zeros) for both cond/uncond — see
+        # inference() line 115: `prev_motion_code = torch.cat([style, style], dim=0)`
+        # and line 153: `prev_motion_code = torch.cat([pred, pred], dim=0)`.
+        prev_motion_code = torch.cat([prev_motion_code_single, prev_motion_code_single], dim=0)
+        prev_feat = self.code_token_embed(self.get_motion_feat(prev_motion_code))
+
+        sos_token = state["sos_token"]
+        style_feat = state["style_feat"]
+        next_ar_vqfeat = sos_token
+
+        # Hierarchical patch decoding (verbatim port of inference() lines 126-149).
+        patch_motion_bits = []
+        for pidx, pn in enumerate(self.patch_nums):
+            attn_feat = self.attn_blocks(next_ar_vqfeat, prev_feat, style_feat)
+            motion_logits = self.logits_head(attn_feat)
+            motion_logits = motion_logits[:, sum(self.patch_nums[:pidx]):]
+            motion_logits = motion_logits.mul(1 / tau)
+            motion_logits = motion_logits.view(motion_logits.shape[0], motion_logits.shape[1], -1, 2)
+            if cfg > 1.0:
+                motion_logits = cfg * motion_logits[:batch_size] + (1 - cfg) * motion_logits[batch_size:]
+            else:
+                motion_logits = motion_logits[:batch_size]
+            motion_bits = sample_idx_with_top_p_(motion_logits)
+            patch_motion_bits.append(motion_bits)
+            if pidx < len(self.patch_nums) - 1:
+                next_ar_vqfeat = self.base_codec.vqidx_to_next_feat(
+                    torch.cat(patch_motion_bits, dim=1), pidx, "accum_next"
+                )
+                next_ar_vqfeat = self.code_token_embed(next_ar_vqfeat)
+                next_ar_vqfeat = torch.cat([next_ar_vqfeat, next_ar_vqfeat], dim=0)  # CFG
+                next_ar_vqfeat = torch.cat([sos_token, next_ar_vqfeat], dim=1)
+
+        patch_motion_bits = torch.cat(patch_motion_bits, dim=1)
+        pred_motion_code = self.base_codec.vqidx_to_motion(patch_motion_bits)  # [1, patch_len, motion_dim]
+
+        # Update state — single (un-doubled) form, redoubling happens next call.
+        state["prev_motion_code"] = pred_motion_code
+        return pred_motion_code, state
+
     def _calc_losses(self, train_results, _loss_kwargs):
         if train_results["pred_motion_logits"].dim() == 3:
             B, L, _ = train_results["pred_motion_logits"].shape
